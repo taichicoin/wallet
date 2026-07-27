@@ -1,0 +1,175 @@
+name: Build Wallet APK (Final)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-33 build-tools;33.0.0'
+
+      - name: Prepare Gradle Project
+        run: |
+          # 创建 Gradle 项目结构
+          mkdir -p wallet-project/app/src/main/java/com/dev/mywallet
+          mkdir -p wallet-project/app/src/main/res/values
+          mkdir -p wallet-project/gradle/wrapper
+
+          # 复制网页资产到 assets
+          cp -r www wallet-project/app/src/main/assets
+          ls -la wallet-project/app/src/main/assets/
+          ls -la wallet-project/app/src/main/assets/js/
+
+          # 项目级 settings.gradle
+          cat > wallet-project/settings.gradle << 'EOF'
+          rootProject.name = "MyWallet"
+          include ':app'
+          EOF
+
+          # 项目级 build.gradle
+          cat > wallet-project/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '7.4.2' apply false
+          }
+          EOF
+
+          # 模块级 build.gradle（添加 androidX webkit 依赖）
+          cat > wallet-project/app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.dev.mywallet'
+              compileSdk 33
+
+              defaultConfig {
+                  applicationId "com.dev.mywallet"
+                  minSdk 21
+                  targetSdk 33
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.8.0'
+          }
+          EOF
+
+          # AndroidManifest.xml
+          cat > wallet-project/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="My Wallet"
+                  android:hardwareAccelerated="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # MainActivity.java 使用 WebViewAssetLoader
+          cat > wallet-project/app/src/main/java/com/dev/mywallet/MainActivity.java << 'JAVA'
+          package com.dev.mywallet;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import androidx.webkit.WebViewAssetLoader;
+
+          public class MainActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  WebView webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+
+                  final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder()
+                      .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                      .build();
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          return assetLoader.shouldInterceptRequest(request.getUrl());
+                      }
+                  });
+
+                  webView.loadUrl("https://appassets.androidplatform.net/assets/index.html");
+                  setContentView(webView);
+              }
+          }
+          JAVA
+
+          # 空资源
+          echo '<?xml version="1.0" encoding="utf-8"?><resources></resources>' > wallet-project/app/src/main/res/values/strings.xml
+
+          # 设置 Gradle Wrapper
+          cat > wallet-project/gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-7.6.3-all.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+          # 复制 gradlew 脚本（用系统自带的生成）
+          cd wallet-project
+          gradle wrapper --gradle-version 7.6.3
+          cd ..
+
+      - name: Build APK with Gradle
+        run: |
+          cd wallet-project
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk ../app-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wallet-apk
+          path: app-debug.apk
