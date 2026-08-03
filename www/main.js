@@ -1,0 +1,583 @@
+// ========== 轻量 scrypt ==========
+const SCRYPT_OPTIONS = { scrypt: { N: 16384 } };
+
+// 多链配置（已移除 Polygon 和 Avalanche C-Chain）
+const chains = [
+    { id: 1, name: "Ethereum", symbol: "ETH", logo: "imagine/eth.jpg", rpcs: ["https://eth.llamarpc.com","https://rpc.ankr.com/eth","https://cloudflare-eth.com"] },
+    { id: 56, name: "BNB Chain", symbol: "BNB", logo: "imagine/bnb.jpg", rpcs: ["https://bsc-dataseed.bnbchain.org","https://bsc-dataseed1.bnbchain.org","https://bsc-dataseed2.bnbchain.org","https://bsc-dataseed3.bnbchain.org","https://bsc-dataseed4.bnbchain.org","https://bsc-rpc.publicnode.com","https://rpc.ankr.com/bsc","https://1rpc.io/bnb","https://bsc.api.pocket.network","https://bsc-mainnet.public.blastapi.io","https://bsc-dataseed1.defibit.io","https://bsc-dataseed2.defibit.io","https://bsc-dataseed1.ninicoin.io","https://bsc-dataseed2.ninicoin.io"] },
+    { id: 97, name: "BSC Testnet", symbol: "tBNB", logo: "imagine/bnb.jpg", rpcs: ["https://data-seed-prebsc-1-s1.binance.org:8545","https://bsc-testnet.publicnode.com"] },
+    { id: 42161, name: "Arbitrum One", symbol: "ETH", logo: "", rpcs: ["https://arb1.arbitrum.io/rpc"] },
+    { id: 10, name: "Optimism", symbol: "ETH", logo: "", rpcs: ["https://mainnet.optimism.io"] }
+];
+
+let wallet = null;
+let provider = null;
+let currentChainId = 1;
+let accounts = [];
+let pendingUnlockIndex = null;
+let lastGoodRpcCache = {};
+
+// 新增：挂起的 DApp 请求（钱包未解锁时暂存）
+let pendingDappRequests = [];
+
+const ERC20_TRANSFER_ABI = [
+    "function transfer(address to, uint amount) returns (bool)"
+];
+
+// ========== Toast 公共函数 ==========
+function showToast(msg, duration = 3000) {
+    const toast = document.getElementById('toast');
+    if (!toast) return;
+    toast.innerText = msg;
+    toast.style.display = 'block';
+    clearTimeout(toast._timeout);
+    toast._timeout = setTimeout(() => { toast.style.display = 'none'; }, duration);
+}
+
+// ========== 本地账户存储 ==========
+function loadAccounts() {
+    const stored = localStorage.getItem('mywallet_accounts_enc');
+    if (stored) { try { accounts = JSON.parse(stored); } catch(e) { accounts = []; } } else accounts = [];
+    updateAccountSelect();
+}
+
+function saveAccounts() {
+    localStorage.setItem('mywallet_accounts_enc', JSON.stringify(accounts));
+    updateAccountSelect();
+}
+
+function updateAccountSelect() {
+    const select = document.getElementById('accountSelect');
+    if (!select) return;
+    select.innerHTML = '<option value="">-- 选择账户 --</option>';
+    accounts.forEach((acc, idx) => {
+        const option = document.createElement('option');
+        option.value = idx;
+        option.text = `${acc.address.substring(0,8)}... (keystore)`;
+        select.appendChild(option);
+    });
+}
+
+// ========== 账户解锁（支付密码）支持指纹 ==========
+function switchAccount() {
+    const idx = document.getElementById('accountSelect').value;
+    if (idx === '') { wallet = null; updateUI(); return; }
+    openUnlockModal(parseInt(idx));
+}
+
+function openUnlockModal(index) {
+    pendingUnlockIndex = index;
+    document.getElementById('unlockPassword').value = '';
+    document.getElementById('unlockStatus').style.display = 'none';
+    document.getElementById('unlockModal').classList.add('active');
+    updatePayUnlockButton();
+}
+
+function closeUnlockModal() {
+    // 如果是因为 DApp 请求而打开的解锁弹窗被用户关闭，拒绝所有挂起请求
+    if (pendingDappRequests.length > 0 && pendingUnlockIndex !== null) {
+        const requests = [...pendingDappRequests];
+        pendingDappRequests = [];
+        requests.forEach(req => {
+            req.respond('用户取消了授权', null);
+        });
+    }
+    document.getElementById('unlockModal').classList.remove('active');
+    pendingUnlockIndex = null;
+}
+
+function updatePayUnlockButton() {
+    const passwordInput = document.getElementById('unlockPassword');
+    const unlockBtn = document.getElementById('payUnlockActionBtn');
+    if (!passwordInput || !unlockBtn) return;
+    if (passwordInput.value.trim().length > 0) {
+        unlockBtn.textContent = '解锁';
+        unlockBtn.onclick = executeUnlock;
+        unlockBtn.className = 'btn-primary';
+    } else {
+        const bioEnabled = localStorage.getItem('biometric_enabled') === 'true';
+        if (bioEnabled) {
+            unlockBtn.textContent = '🔐 指纹解锁';
+            unlockBtn.onclick = startPayBiometric;
+            unlockBtn.className = 'btn-outline';
+        } else {
+            unlockBtn.textContent = '解锁';
+            unlockBtn.onclick = executeUnlock;
+            unlockBtn.className = 'btn-primary';
+        }
+    }
+}
+
+function startPayBiometric() {
+    if (!window.android || typeof window.android.biometricAuth !== 'function') {
+        showToast('当前设备不支持指纹解锁');
+        return;
+    }
+    const originalCallback = window.__onBiometricResult;
+    window.__biometricContext = 'pay';
+    window.__onBiometricResult = function(success, errorMsg) {
+        if (window.__biometricContext === 'pay') {
+            if (success) {
+                if (window.android && typeof window.android.getSecret === 'function') {
+                    window.android.getSecret('wallet_pay_pwd');
+                } else {
+                    showToast('安全存储不可用');
+                    window.__biometricContext = null;
+                    window.__onBiometricResult = originalCallback;
+                }
+            } else {
+                document.getElementById('unlockStatus').style.display = 'block';
+                document.getElementById('unlockStatus').className = 'tx-status error';
+                document.getElementById('unlockStatus').innerText = errorMsg || '指纹验证失败';
+                window.__biometricContext = null;
+                window.__onBiometricResult = originalCallback;
+            }
+        }
+    };
+    window.android.biometricAuth();
+}
+
+window.__onSecretRetrieved = function(key, value) {
+    if (key === 'wallet_pay_pwd' && value) {
+        document.getElementById('unlockPassword').value = value;
+        if (window.__biometricContext === 'pay') {
+            window.__biometricContext = null;
+            window.__onBiometricResult = function(success, errorMsg) {
+                if (success) showMainApp();
+                else {
+                    document.getElementById('securityUnlockError').style.display = 'block';
+                    document.getElementById('securityUnlockError').innerText = errorMsg || '指纹验证失败';
+                }
+            };
+            executeUnlock();
+        }
+    } else {
+        showToast('未找到保存的密码，请先手动输入一次');
+    }
+};
+
+async function executeUnlock() {
+    const statusEl = document.getElementById('unlockStatus');
+    const password = document.getElementById('unlockPassword').value;
+    if (!password) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'tx-status error';
+        statusEl.innerText = '请输入密码';
+        return;
+    }
+    showToast('正在解锁...', 2000);
+    const acc = accounts[pendingUnlockIndex];
+    try {
+        wallet = await ethers.Wallet.fromEncryptedJson(acc.keystore, password);
+        if (provider) wallet = wallet.connect(provider);
+        updateUI();
+        loadBalances();
+        closeUnlockModal();
+        showToast('解锁成功');
+        if (localStorage.getItem('biometric_enabled') === 'true' &&
+            window.android && typeof window.android.saveSecret === 'function') {
+            window.android.saveSecret('wallet_pay_pwd', password);
+        }
+
+        // 处理所有因 DApp 请求而挂起的操作
+        if (pendingDappRequests.length > 0) {
+            processPendingDappRequests();
+            // 通知 DApp 浏览器地址变更
+            if (window.android && typeof window.android.updateAccounts === 'function') {
+                window.android.updateAccounts(wallet.address);
+            }
+        }
+    } catch (e) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'tx-status error';
+        statusEl.innerText = '密码错误或数据损坏';
+    }
+}
+
+// ========== 新增：挂起请求处理 ==========
+function tryOpenUnlockForDapp() {
+    // 如果已有解锁弹窗在显示，不重复弹出
+    if (pendingUnlockIndex !== null) return;
+    const select = document.getElementById('accountSelect');
+    // 没有可选账户
+    if (!select || select.selectedIndex <= 0) {
+        if (pendingDappRequests.length > 0) {
+            const req = pendingDappRequests.shift();
+            req.respond('没有导入钱包，请先在设置中导入', null);
+            showToast('没有可用的钱包账户');
+        }
+        return;
+    }
+    const idx = select.value;
+    openUnlockModal(parseInt(idx));
+}
+
+function processPendingDappRequests() {
+    if (!wallet) return;
+    const requests = [...pendingDappRequests];
+    pendingDappRequests = [];
+    requests.forEach(req => {
+        // 重新调用 handle，此时 wallet 已存在
+        window.__walletAPI.handle(req.method, JSON.stringify(req.params), req.callbackId);
+    });
+}
+
+// ========== 导入钱包 ==========
+async function importWallet() {
+    showToast('正在加密...', 3000);
+    const input = document.getElementById('secretInput').value.trim();
+    const pwd = document.getElementById('encryptPassword').value;
+    const confirm = document.getElementById('encryptPasswordConfirm').value;
+    if (!input) return showToast('请输入助记词或私钥');
+    if (!pwd || pwd.length < 6) return showToast('密码至少6位');
+    if (pwd !== confirm) return showToast('两次密码不一致');
+    let temp;
+    try { temp = input.startsWith('0x') && input.length === 66 ? new ethers.Wallet(input) : ethers.Wallet.fromMnemonic(input); }
+    catch (e) { return showToast('无效的助记词或私钥'); }
+    if (accounts.some(a => a.address.toLowerCase() === temp.address.toLowerCase())) return showToast('地址已存在');
+    try {
+        const keystoreJson = await temp.encrypt(pwd, SCRYPT_OPTIONS);
+        accounts.push({ address: temp.address, keystore: keystoreJson, type: 'keystore' });
+        saveAccounts();
+        ['secretInput','encryptPassword','encryptPasswordConfirm'].forEach(id => document.getElementById(id).value = '');
+        const newIndex = accounts.length - 1;
+        document.getElementById('accountSelect').value = newIndex;
+        showToast('导入成功，请解锁');
+        openUnlockModal(newIndex);
+    } catch (e) { showToast('加密失败: ' + e.message); }
+}
+
+function deleteAccount() {
+    const idx = document.getElementById('accountSelect').value;
+    if (idx === '') return;
+    if (!confirm('确定删除该账户？')) return;
+    accounts.splice(parseInt(idx), 1);
+    saveAccounts();
+    wallet = null;
+    updateUI();
+    if (accounts.length > 0) { document.getElementById('accountSelect').value = 0; switchAccount(); }
+    showToast('账户已删除');
+}
+
+// ========== 网络 ==========
+async function connectToChain(chain) {
+    const rpcList = chain.rpcs.slice();
+    const cached = lastGoodRpcCache[chain.id];
+    if (cached !== undefined) rpcList.unshift(rpcList.splice(cached, 1)[0]);
+    const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('超时')), 12000));
+    const races = rpcList.map(rpc => new Promise(async resolve => {
+        try {
+            const prov = new ethers.providers.JsonRpcProvider({ url: rpc, timeout: 5000 }, { chainId: chain.id, name: chain.name });
+            await prov.getBlockNumber();
+            lastGoodRpcCache[chain.id] = chain.rpcs.indexOf(rpc);
+            resolve(prov);
+        } catch (e) {}
+    }));
+    try { return await Promise.race([...races, timeout]); } catch (e) { throw new Error('所有节点不可用'); }
+}
+
+async function switchChain(chainId) {
+    const chain = chains.find(c => c.id === chainId);
+    if (!chain) return;
+    showToast('切换网络中...', 2000);
+    try {
+        provider = await connectToChain(chain);
+        currentChainId = chain.id;
+        if (wallet) wallet = wallet.connect(provider);
+        updateNetworkUI();
+        loadBalances();
+        closeNetworkModal();
+        showToast('网络已连接', 1500);
+        if (window.android && window.android.updateChainId) {
+            window.android.updateChainId(chain.id);
+        }
+    } catch(e) { showToast('连接失败'); }
+}
+
+// ========== 余额 ==========
+async function loadBalances() {
+    if (!wallet || !provider) return;
+    const chain = chains.find(c => c.id === currentChainId);
+    let mainDisplay = '0';
+    try {
+        const raw = await provider.getBalance(wallet.address);
+        mainDisplay = formatBalance(raw);
+        document.getElementById('totalBalance').innerText = `${mainDisplay} ${chain.symbol}`;
+        document.getElementById('fiatValue').innerText = '$0.00 USD';
+    } catch(e) { document.getElementById('totalBalance').innerText = '--'; }
+    if (typeof renderTokenList === 'function') {
+        const tokenResults = typeof getCustomTokenBalances === 'function' ? await getCustomTokenBalances() : [];
+        renderTokenList(chain.symbol, mainDisplay, tokenResults);
+    }
+}
+
+function formatBalance(rawBalance, decimals = 18) {
+    if (!rawBalance || rawBalance === '0' || ethers.BigNumber.from(rawBalance).isZero()) return '0';
+    const str = ethers.utils.formatUnits(rawBalance, decimals);
+    const parts = str.split('.');
+    if (parts.length === 1) return str;
+    let zeros = 0;
+    for (const c of parts[1]) { if (c === '0') zeros++; else break; }
+    if (zeros >= 7) return '0';
+    const num = parseFloat(str);
+    return num === 0 ? '0' : num.toFixed(6).replace(/\.?0+$/, '');
+}
+
+// ========== UI ==========
+function updateUI() {
+    const el = document.getElementById('topAddress');
+    if (el) el.innerText = wallet ? wallet.address.substring(0,6)+'...'+wallet.address.slice(-4) : '未导入';
+    updateNetworkUI();
+}
+
+function updateNetworkUI() {
+    const chain = chains.find(c => c.id === currentChainId);
+    if (!chain) return;
+    document.getElementById('topNetwork').innerText = chain.name;
+    const logoImg = document.getElementById('networkLogo');
+    if (logoImg) {
+        if (chain.logo) {
+            logoImg.src = chain.logo;
+            logoImg.style.display = 'block';
+        } else {
+            logoImg.style.display = 'none';
+        }
+    }
+    renderChainList();
+}
+
+function openNetworkModal() { document.getElementById('networkModal').classList.add('active'); renderChainList(); }
+function closeNetworkModal() { document.getElementById('networkModal').classList.remove('active'); }
+
+function renderChainList() {
+    const container = document.getElementById('chainListContainer');
+    if (!container) return;
+    container.innerHTML = chains.map(c => {
+        const iconHtml = c.logo
+            ? `<img src="${c.logo}" class="chain-icon" style="object-fit:cover;" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" />`
+            : '';
+        const fallbackHtml = c.logo
+            ? `<div class="chain-icon" style="display:none; background:#333; align-items:center; justify-content:center;">${c.symbol[0]}</div>`
+            : `<div class="chain-icon" style="background:#333; display:flex; align-items:center; justify-content:center;">${c.symbol[0]}</div>`;
+        return `
+            <div class="chain-list-item ${c.id === currentChainId ? 'active' : ''}" onclick="switchChain(${c.id})">
+                ${iconHtml}${fallbackHtml}
+                <div>
+                    <div class="chain-name">${c.name}</div>
+                    <div class="chain-symbol">${c.symbol}</div>
+                </div>
+                ${c.id === currentChainId ? '<span style="margin-left:auto;color:var(--green);">✔</span>' : ''}
+            </div>`;
+    }).join('');
+}
+
+// ========== 发送（支持主网币和代币） ==========
+function openSendModal() {
+    if (!wallet) return showToast('请先解锁');
+    document.getElementById('sendModal').classList.add('active');
+    updateTokenSelect();
+}
+function closeSendModal() { document.getElementById('sendModal').classList.remove('active'); }
+
+function updateTokenSelect() {
+    const select = document.getElementById('tokenSelect');
+    if (!select) return;
+    const chain = chains.find(c => c.id === currentChainId);
+    let options = `<option value="native" data-decimals="18">${chain.symbol} (主网币)</option>`;
+    if (typeof getImportedTokens === 'function') {
+        const tokens = getImportedTokens();
+        tokens.forEach(t => options += `<option value="${t.address}" data-decimals="${t.decimals || 18}">${t.symbol}</option>`);
+    }
+    select.innerHTML = options;
+}
+
+async function executeSend() {
+    const status = document.getElementById('sendStatus');
+    status.style.display = 'block'; status.className = 'tx-status pending'; status.innerText = '检查输入...';
+    if (!wallet || !provider) { status.className = 'tx-status error'; status.innerText = '钱包未连接'; return; }
+    const toAddress = document.getElementById('sendTo').value.trim();
+    const amount = document.getElementById('sendAmount').value.trim();
+    const tokenSelect = document.getElementById('tokenSelect');
+    const selectedValue = tokenSelect.value;
+    const selectedOption = tokenSelect.options[tokenSelect.selectedIndex];
+    const decimals = parseInt(selectedOption.getAttribute('data-decimals')) || 18;
+    if (!ethers.utils.isAddress(toAddress)) { status.className = 'tx-status error'; status.innerText = '无效地址'; return; }
+    if (!amount || isNaN(amount) || Number(amount) <= 0) { status.className = 'tx-status error'; status.innerText = '金额无效'; return; }
+    if (wallet.provider !== provider) wallet = wallet.connect(provider);
+    try {
+        status.innerText = '发送中...';
+        let tx;
+        if (selectedValue === 'native') {
+            tx = await wallet.sendTransaction({ to: toAddress, value: ethers.utils.parseEther(amount) });
+        } else {
+            const contract = new ethers.Contract(selectedValue, ERC20_TRANSFER_ABI, wallet);
+            tx = await contract.transfer(toAddress, ethers.utils.parseUnits(amount, decimals));
+        }
+        status.className = 'tx-status success';
+        status.innerText = '成功！\n' + tx.hash;
+        setTimeout(() => loadBalances(), 2000);
+    } catch (e) {
+        status.className = 'tx-status error';
+        status.innerText = '失败: ' + (e.reason || e.message);
+    }
+}
+
+function showReceiveModal() { if (wallet) showToast(wallet.address, 4000); else showToast('请先解锁'); }
+
+// ========== 启动 ==========
+function startApp() {
+    loadAccounts();
+    switchChain(1);
+    ['networkModal','sendModal','unlockModal'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('click', e => { if (e.target === el) el.classList.remove('active'); });
+    });
+    if (!document.getElementById('exportKeyModal')) {
+        injectExportKeyUI();
+    }
+}
+
+// ========== DApp 钱包桥接（原生浏览器调用） ==========
+window.__walletAPI = {
+    getChainId: () => currentChainId.toString(),
+    handle: function(method, paramsJson, callbackId) {
+        const params = JSON.parse(paramsJson);
+        const respond = (error, result) => {
+            if (window.android && window.android.returnResult) {
+                window.android.returnResult(callbackId, JSON.stringify(error), JSON.stringify(result));
+            } else {
+                console.warn('returnResult 不可用，DApp 请求将无响应');
+            }
+        };
+
+        // 内部辅助：检查钱包是否可用，若未解锁则暂存请求并触发解锁
+        const requireWallet = (respond) => {
+            if (!wallet) {
+                pendingDappRequests.push({ method, params, callbackId, respond });
+                tryOpenUnlockForDapp();
+                return false;
+            }
+            return true;
+        };
+
+        (async () => {
+            try {
+                if (method === 'eth_requestAccounts' || method === 'eth_accounts') {
+                    if (!wallet) {
+                        pendingDappRequests.push({ method, params, callbackId, respond });
+                        tryOpenUnlockForDapp();
+                        return;
+                    }
+                    respond(null, [wallet.address]);
+                } else if (method === 'eth_chainId') {
+                    respond(null, '0x' + currentChainId.toString(16));
+                } else if (method === 'eth_sendTransaction') {
+                    if (!requireWallet(respond)) return;
+                    const tx = await wallet.sendTransaction(params[0]);
+                    respond(null, tx.hash);
+                } else if (method === 'eth_signTransaction') {
+                    if (!requireWallet(respond)) return;
+                    const signedTx = await wallet.signTransaction(params[0]);
+                    respond(null, signedTx);
+                } else if (method === 'personal_sign') {
+                    if (!requireWallet(respond)) return;
+                    const sig = await wallet.signMessage(params[0]);
+                    respond(null, sig);
+                } else if (method === 'eth_sign') {
+                    if (!requireWallet(respond)) return;
+                    const sig = await wallet.signMessage(ethers.utils.arrayify(params[1]));
+                    respond(null, sig);
+                } else if (method === 'wallet_switchEthereumChain') {
+                    const chainId = parseInt(params[0].chainId);
+                    await switchChain(chainId);
+                    respond(null, null);
+                } else if (method === 'wallet_addEthereumChain') {
+                    respond(null, null);
+                } else if (method === 'wallet_requestPermissions') {
+                    if (!requireWallet(respond)) return;
+                    respond(null, [{ parentCapability: 'eth_accounts' }]);
+                } else if (method === 'wallet_getPermissions') {
+                    if (!requireWallet(respond)) return;
+                    respond(null, [{ parentCapability: 'eth_accounts' }]);
+                } else if (method === 'net_version') {
+                    respond(null, currentChainId.toString());
+                } else {
+                    throw new Error('不支持的方法: ' + method);
+                }
+            } catch (e) { respond(e.message || '未知错误', null); }
+        })();
+    }
+};
+
+// ========== 导出私钥（自动注入 UI） ==========
+function injectExportKeyUI() {
+    const settingsContent = document.querySelector('#settingsModal .modal-content');
+    if (settingsContent && !document.getElementById('exportKeyBtn')) {
+        const btn = document.createElement('button');
+        btn.id = 'exportKeyBtn';
+        btn.className = 'btn-outline';
+        btn.textContent = '导出私钥';
+        btn.style.marginTop = '8px';
+        btn.onclick = openExportPrivateKey;
+        const deleteBtn = settingsContent.querySelector('.btn-outline');
+        if (deleteBtn) {
+            deleteBtn.insertAdjacentElement('afterend', btn);
+        } else {
+            settingsContent.appendChild(btn);
+        }
+    }
+    if (!document.getElementById('exportKeyModal')) {
+        const modalHTML = `
+            <div class="modal-overlay" id="exportKeyModal">
+                <div class="modal-content">
+                    <div class="modal-title">
+                        <span>导出私钥</span>
+                        <span onclick="closeExportKeyModal()" class="close-btn">&times;</span>
+                    </div>
+                    <input type="password" id="exportKeyPassword" placeholder="输入支付密码" />
+                    <button class="btn-primary" onclick="confirmExportKey()">确认</button>
+                    <div id="exportKeyStatus" class="tx-status" style="display:none;"></div>
+                </div>
+            </div>
+        `;
+        document.body.insertAdjacentHTML('beforeend', modalHTML);
+        document.getElementById('exportKeyModal').addEventListener('click', function(e) {
+            if (e.target === this) closeExportKeyModal();
+        });
+    }
+}
+
+function openExportPrivateKey() {
+    if (!wallet) { showToast('请先解锁钱包'); return; }
+    document.getElementById('exportKeyPassword').value = '';
+    document.getElementById('exportKeyStatus').style.display = 'none';
+    document.getElementById('exportKeyModal').classList.add('active');
+}
+
+function closeExportKeyModal() { document.getElementById('exportKeyModal').classList.remove('active'); }
+
+async function confirmExportKey() {
+    const statusEl = document.getElementById('exportKeyStatus');
+    const password = document.getElementById('exportKeyPassword').value;
+    if (!password) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'tx-status error';
+        statusEl.innerText = '请输入密码';
+        return;
+    }
+    const idx = document.getElementById('accountSelect').value;
+    if (idx === '') { showToast('请先选择一个账户'); closeExportKeyModal(); return; }
+    const acc = accounts[parseInt(idx)];
+    try {
+        const tempWallet = await ethers.Wallet.fromEncryptedJson(acc.keystore, password);
+        const privateKey = tempWallet.privateKey;
+        statusEl.style.display = 'block';
+        statusEl.className = 'tx-status success';
+        statusEl.innerText = '私钥：' + privateKey;
+        try { await navigator.clipboard.writeText(privateKey); statusEl.innerText += '\n(已复制到剪贴板)'; } catch (e) {}
+    } catch (e) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'tx-status error';
+        statusEl.innerText = '密码错误或数据损坏';
+    }
+}
